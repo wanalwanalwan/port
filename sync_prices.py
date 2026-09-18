@@ -114,4 +114,117 @@ AUTO_RESOLVE_MAX_RANK = 500  # only auto-pick coins in CoinGecko's top 500 by ma
 def resolve_coingecko_id(ticker, name):
     """
     Guess a CoinGecko ID from a ticker. Returns (id, None) when confident,
-    or (None, reason)
+    or (None, reason) when a human should decide.
+
+    Confident = an exact symbol match in the top AUTO_RESOLVE_MAX_RANK by market cap,
+    and (if several match) it is by far the largest. Small/new tokens are never
+    auto-picked because copycat tokens reuse their tickers.
+    """
+    headers = {"accept": "application/json"}
+    if COINGECKO_KEY:
+        headers["x-cg-demo-api-key"] = COINGECKO_KEY
+    qs = urllib.parse.urlencode({"query": ticker})
+    res = http("GET", f"https://api.coingecko.com/api/v3/search?{qs}", headers)
+
+    matches = [c for c in res.get("coins", []) if c.get("symbol", "").lower() == ticker]
+    ranked = sorted((c for c in matches if c.get("market_cap_rank")),
+                    key=lambda c: c["market_cap_rank"])
+    if not ranked:
+        return None, f"no ranked coin with ticker '{ticker}' ({len(matches)} unranked)"
+
+    top = ranked[0]
+    if top["market_cap_rank"] > AUTO_RESOLVE_MAX_RANK:
+        return None, f"best match '{top['id']}' is rank {top['market_cap_rank']}, too small to auto-pick"
+
+    # If the row's name matches a specific candidate, trust that over rank
+    for c in ranked:
+        if name and c.get("name", "").lower() == name.lower():
+            return c["id"], None
+
+    if len(ranked) > 1 and ranked[1]["market_cap_rank"] <= AUTO_RESOLVE_MAX_RANK:
+        others = ", ".join(c["id"] for c in ranked[:4])
+        return None, f"ambiguous ticker '{ticker}': {others}"
+    return top["id"], None
+
+
+def dexscreener_price(pair):
+    """pair = 'chainId/pairAddress', as in https://dexscreener.com/<chainId>/<pairAddress>"""
+    res = http("GET", f"https://api.dexscreener.com/latest/dex/pairs/{pair}")
+    pairs = res.get("pairs") or ([res["pair"]] if res.get("pair") else [])
+    if pairs and pairs[0].get("priceUsd"):
+        return float(pairs[0]["priceUsd"])
+    return None
+
+
+def main():
+    if not NOTION_TOKEN or not DATA_SOURCE_ID:
+        sys.exit("Set NOTION_TOKEN and NOTION_DATA_SOURCE_ID.")
+
+    rows = fetch_rows()
+    print(f"Found {len(rows)} open crypto rows")
+
+    # Auto-fill CoinGecko IDs from tickers where it's safe; write them back so
+    # they're visible in Notion (and editable if the guess is ever wrong).
+    needs_review = []
+    for r in rows:
+        if r["coingecko_id"] or r["dex_pair"] or not r["ticker"]:
+            continue
+        try:
+            cid, reason = resolve_coingecko_id(r["ticker"], r["name"])
+        except Exception as e:
+            cid, reason = None, str(e)
+        if not cid:
+            needs_review.append(f"{r['name']}: {reason}")
+            continue
+        print(f"  Resolved {r['name']} ({r['ticker'].upper()}) -> {cid}")
+        r["coingecko_id"] = cid
+        if not DRY_RUN:
+            notion("PATCH", f"/pages/{r['id']}", {
+                "properties": {"CoinGecko ID": {"rich_text": [{"text": {"content": cid}}]}}
+            })
+        time.sleep(2)  # CoinGecko search is rate-limited on the free tier
+
+    cg = coingecko_prices({r["coingecko_id"] for r in rows if r["coingecko_id"]})
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    updated, skipped, failed = 0, [], []
+    for r in rows:
+        price, source = None, None
+        try:
+            if r["coingecko_id"]:
+                price, source = cg.get(r["coingecko_id"]), "coingecko"
+            elif r["dex_pair"]:
+                price, source = dexscreener_price(r["dex_pair"]), "dexscreener"
+            else:
+                skipped.append(r["name"])
+                continue
+
+            if price is None:
+                failed.append(f"{r['name']} (no price from {source})")
+                continue
+
+            print(f"  {r['name']:<24} ${price:,.8g}  [{source}]")
+            if not DRY_RUN:
+                notion("PATCH", f"/pages/{r['id']}", {
+                    "properties": {
+                        "Current Price": {"number": price},
+                        "Price Updated": {"date": {"start": now}},
+                    }
+                })
+                time.sleep(0.35)  # stay under Notion's ~3 req/s limit
+            updated += 1
+        except Exception as e:  # keep going if one row fails
+            failed.append(f"{r['name']} ({e})")
+
+    print(f"\nUpdated: {updated}{' (dry run)' if DRY_RUN else ''}")
+    if needs_review:
+        print("Needs a CoinGecko ID or DexScreener Pair set by hand:\n  " + "\n  ".join(needs_review))
+    if skipped:
+        print(f"Skipped (no Ticker, ID, or pair): {', '.join(skipped)}")
+    if failed:
+        print("Failed:\n  " + "\n  ".join(failed))
+        sys.exit(1)  # makes the GitHub Actions run show red so you notice
+
+
+if __name__ == "__main__":
+    main()
