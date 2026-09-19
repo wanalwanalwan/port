@@ -92,6 +92,7 @@ def fetch_rows():
                 "ticker": plain_text(p.get("Ticker")).lstrip("$").lower(),
                 "coingecko_id": plain_text(p.get("CoinGecko ID")).lower(),
                 "dex_pair": plain_text(p.get("DexScreener Pair")).strip("/"),
+                "old_price": (p.get("Current Price") or {}).get("number"),
             })
         if not res.get("has_more"):
             return rows
@@ -148,13 +149,23 @@ def resolve_coingecko_id(ticker, name):
     return top["id"], None
 
 
-def dexscreener_price(pair):
-    """pair = 'chainId/pairAddress', as in https://dexscreener.com/<chainId>/<pairAddress>"""
+def dexscreener_price(pair, ticker=""):
+    """pair = 'chainId/pairAddress', as in https://dexscreener.com/<chainId>/<pairAddress>.
+    Returns the USD price of the token matching ticker, whichever side of the pair it is on."""
     res = http("GET", f"https://api.dexscreener.com/latest/dex/pairs/{pair}")
     pairs = res.get("pairs") or ([res["pair"]] if res.get("pair") else [])
-    if pairs and pairs[0].get("priceUsd"):
-        return float(pairs[0]["priceUsd"])
-    return None
+    if not pairs or not pairs[0].get("priceUsd"):
+        return None
+    p = pairs[0]
+    base = (p.get("baseToken") or {}).get("symbol", "").lower()
+    quote = (p.get("quoteToken") or {}).get("symbol", "").lower()
+    base_usd = float(p["priceUsd"])
+    if not ticker or base == ticker:
+        return base_usd
+    if quote == ticker and float(p.get("priceNative") or 0) > 0:
+        # priceNative = base price in quote units, so quote USD = base USD / priceNative
+        return base_usd / float(p["priceNative"])
+    raise RuntimeError(f"ticker '{ticker}' not in pair ({base}/{quote})")
 
 
 def main():
@@ -195,13 +206,19 @@ def main():
             if r["coingecko_id"]:
                 price, source = cg.get(r["coingecko_id"]), "coingecko"
             elif r["dex_pair"]:
-                price, source = dexscreener_price(r["dex_pair"]), "dexscreener"
+                price, source = dexscreener_price(r["dex_pair"], r["ticker"]), "dexscreener"
             else:
                 skipped.append(r["name"])
                 continue
 
             if price is None:
                 failed.append(f"{r['name']} (no price from {source})")
+                continue
+
+            # Sanity check: refuse a price more than 3x away from the last one (bad data)
+            old = r["old_price"]
+            if old and (price > old * 3 or price < old / 3):
+                failed.append(f"{r['name']} (suspicious price ${price:,.8g} vs last ${old:,.8g}, not written)")
                 continue
 
             print(f"  {r['name']:<24} ${price:,.8g}  [{source}]")
