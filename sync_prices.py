@@ -35,6 +35,7 @@ DRY_RUN = os.environ.get("DRY_RUN") == "1"
 
 
 def http(method, url, headers=None, body=None, retries=3):
+  headers = {"User-Agent": "Mozilla/5.0 (crypto-price-sync)", **(headers or {})}
     data = json.dumps(body).encode() if body is not None else None
     for attempt in range(retries):
         req = urllib.request.Request(url, data=data, method=method, headers=headers or {})
