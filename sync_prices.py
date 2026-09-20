@@ -9,6 +9,13 @@ For every row where Class = Crypto and Status != Exited:
   - Else                          -> skipped (logged)
 Writes "Current Price" and "Price Updated".
 
+Market metrics (see sync_metrics):
+  - "Volume 24h" / "Volume WoW %" from CoinGecko for rows with a CoinGecko ID
+  - "Holders" / "Holders WoW %" / "Top 10 %" from the chain explorer for rows
+    with "Contract" set (format: chain/0xaddress, e.g. robinhood/0x2e8c...)
+  Holder history is kept in holder_history.json (one snapshot per day) so
+  WoW can be computed; the workflow commits that file back to the repo.
+
 Stdlib only. Env vars:
   NOTION_TOKEN           (required) Notion internal integration secret
   NOTION_DATA_SOURCE_ID  (required) Assets data source ID
@@ -23,7 +30,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 NOTION_VERSION = "2025-09-03"
 NOTION_API = "https://api.notion.com/v1"
@@ -92,6 +99,7 @@ def fetch_rows():
                 "ticker": plain_text(p.get("Ticker")).lstrip("$").lower(),
                 "coingecko_id": plain_text(p.get("CoinGecko ID")).lower(),
                 "dex_pair": plain_text(p.get("DexScreener Pair")).strip("/"),
+                "contract": plain_text(p.get("Contract")).strip("/").lower(),
                 "old_price": (p.get("Current Price") or {}).get("number"),
             })
         if not res.get("has_more"):
@@ -168,6 +176,136 @@ def dexscreener_price(pair, ticker=""):
     raise RuntimeError(f"ticker '{ticker}' not in pair ({base}/{quote})")
 
 
+# ---------------------------------------------------------------------------
+# Market metrics: volume WoW (CoinGecko) and holders / top-10 share (explorer)
+# ---------------------------------------------------------------------------
+
+HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "holder_history.json")
+
+# Blockscout explorers by chain name used in the "Contract" property
+EXPLORERS = {
+    "robinhood": "https://robinhoodchain.blockscout.com",
+}
+
+# Never counted as holders in the top-10 share
+BURN_ADDRESSES = {
+    "0x" + "0" * 40,
+    "0x" + "0" * 36 + "dead",
+}
+
+
+def coingecko_volume(cid):
+    """(latest 24h volume, WoW change as a fraction).
+    WoW = average rolling-24h volume over the last 7 days vs the 7 days before."""
+    headers = {"accept": "application/json"}
+    if COINGECKO_KEY:
+        headers["x-cg-demo-api-key"] = COINGECKO_KEY
+    qs = urllib.parse.urlencode({"vs_currency": "usd", "days": 14})
+    res = http("GET", f"https://api.coingecko.com/api/v3/coins/{cid}/market_chart?{qs}", headers)
+    vols = res.get("total_volumes") or []
+    if not vols:
+        return None, None
+    latest_ts, latest = vols[-1]
+    week_ms = 7 * 24 * 3600 * 1000
+    this_week = [v for t, v in vols if t > latest_ts - week_ms]
+    last_week = [v for t, v in vols if latest_ts - 2 * week_ms < t <= latest_ts - week_ms]
+    wow = None
+    if this_week and last_week and sum(last_week) > 0:
+        wow = (sum(this_week) / len(this_week)) / (sum(last_week) / len(last_week)) - 1
+    return latest, wow
+
+
+def explorer_holders(contract):
+    """contract = 'chain/0xaddress'. Returns (holder count, top-10 share as a fraction, excluded list).
+    Top 10 skips burn addresses and verified/named contracts (LP pools, vaults),
+    since those aren't people who can sell."""
+    chain, _, address = contract.partition("/")
+    base = EXPLORERS.get(chain)
+    if not base or not address.startswith("0x"):
+        raise RuntimeError(f"bad Contract '{contract}' (use chain/0xaddress; known chains: {', '.join(EXPLORERS)})")
+
+    token = http("GET", f"{base}/api/v2/tokens/{address}")
+    count = token.get("holders_count") or token.get("holders")
+    count = int(count) if count is not None else None
+    decimals = int(token.get("decimals") or 18)
+    supply = int(token.get("total_supply") or 0) / 10 ** decimals
+
+    top, excluded = [], []
+    res = http("GET", f"{base}/api/v2/tokens/{address}/holders")
+    for item in res.get("items", []):
+        addr = item.get("address") or {}
+        h = (addr.get("hash") or "").lower()
+        amount = int(item.get("value") or 0) / 10 ** decimals
+        label = "burn" if h in BURN_ADDRESSES else (addr.get("name") or h[:10])
+        if h in BURN_ADDRESSES or (addr.get("is_contract") and (addr.get("is_verified") or addr.get("name"))):
+            excluded.append(f"{label} ({amount / supply:.1%})" if supply else label)
+            continue
+        top.append(amount)
+        if len(top) == 10:
+            break
+    share = sum(top) / supply if supply else None
+    return count, share, excluded
+
+
+def load_history():
+    try:
+        with open(HISTORY_FILE) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+
+def holders_wow(history, key, count, today):
+    """Compare today's count to the newest snapshot that is at least 7 days old."""
+    snaps = history.get(key, {})
+    cutoff = (datetime.fromisoformat(today) - timedelta(days=7)).date().isoformat()
+    old_days = sorted(d for d in snaps if d <= cutoff)
+    if not old_days or not snaps[old_days[-1]]:
+        return None
+    return count / snaps[old_days[-1]] - 1
+
+
+def sync_metrics(rows):
+    history = load_history()
+    today = datetime.now(timezone.utc).date().isoformat()
+    failed = []
+    print("\nMarket metrics:")
+    for r in rows:
+        props = {}
+        try:
+            if r["coingecko_id"]:
+                vol, vwow = coingecko_volume(r["coingecko_id"])
+                time.sleep(2)  # CoinGecko free tier rate limit
+                if vol is not None:
+                    props["Volume 24h"] = {"number": round(vol, 2)}
+                    props["Volume WoW %"] = {"number": round(vwow, 4) if vwow is not None else None}
+            if r["contract"]:
+                count, share, excluded = explorer_holders(r["contract"])
+                if count is not None:
+                    history.setdefault(r["contract"], {}).setdefault(today, count)  # first snapshot of the day
+                    hwow = holders_wow(history, r["contract"], count, today)
+                    props["Holders"] = {"number": count}
+                    props["Holders WoW %"] = {"number": round(hwow, 4) if hwow is not None else None}
+                if share is not None:
+                    props["Top 10 %"] = {"number": round(share, 4)}
+                if excluded:
+                    print(f"    {r['name']}: top 10 excludes {', '.join(excluded)}")
+        except Exception as e:
+            failed.append(f"{r['name']} metrics ({e})")
+        if props:
+            shown = {k: v["number"] for k, v in props.items()}
+            print(f"  {r['name']:<24} {shown}")
+            if not DRY_RUN:
+                notion("PATCH", f"/pages/{r['id']}", {"properties": props})
+                time.sleep(0.35)
+
+    if not DRY_RUN:
+        with open(HISTORY_FILE, "w") as f:
+            json.dump(history, f, indent=2, sort_keys=True)
+            f.write("\n")
+    return failed
+
+
 def main():
     if not NOTION_TOKEN or not DATA_SOURCE_ID:
         sys.exit("Set NOTION_TOKEN and NOTION_DATA_SOURCE_ID.")
@@ -203,10 +341,12 @@ def main():
     for r in rows:
         price, source = None, None
         try:
-            if r["coingecko_id"]:
-                price, source = cg.get(r["coingecko_id"]), "coingecko"
-            elif r["dex_pair"]:
+            # An explicit DexScreener pair wins, so a row can use CoinGecko for
+            # volume stats while keeping its on-chain pool price.
+            if r["dex_pair"]:
                 price, source = dexscreener_price(r["dex_pair"], r["ticker"]), "dexscreener"
+            elif r["coingecko_id"]:
+                price, source = cg.get(r["coingecko_id"]), "coingecko"
             else:
                 skipped.append(r["name"])
                 continue
@@ -233,6 +373,11 @@ def main():
             updated += 1
         except Exception as e:  # keep going if one row fails
             failed.append(f"{r['name']} ({e})")
+
+    try:
+        failed += sync_metrics(rows)
+    except Exception as e:
+        failed.append(f"metrics ({e})")
 
     print(f"\nUpdated: {updated}{' (dry run)' if DRY_RUN else ''}")
     if needs_review:
