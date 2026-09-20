@@ -9,6 +9,9 @@ concurrency:
   group: price-sync
   cancel-in-progress: true
 
+permissions:
+  contents: write   # lets the job commit holder_history.json
+
 jobs:
   sync:
     runs-on: ubuntu-latest
@@ -24,3 +27,13 @@ jobs:
           COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
           NOTION_DATA_SOURCE_ID: 181ec133-d228-4a13-8c8b-38e3236edd8f
         run: python sync_prices.py
+      - name: Save holder history
+        if: always()
+        run: |
+          if [ -n "$(git status --porcelain holder_history.json)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898333+github-actions[bot]@users.noreply.github.com"
+            git add holder_history.json
+            git commit -m "Holder snapshot $(date -u +%F)"
+            git pull --rebase && git push
+          fi
